@@ -1,106 +1,130 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.0;
+pragma solidity ^0.8.0;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
-import "./Interfaces/INFTStaking.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
-contract NFTStaking is INFTStaking, Ownable, UUPSUpgradeable {
-    IERC20 public rewardToken;
-    IERC721 public nft;
-    uint256 public override rewardRate;
-    bool public paused;
+contract NFTStaking is Initializable, UUPSUpgradeable, OwnableUpgradeable,PausableUpgradeable{
+    ERC721Upgradeable public nft;
+    ERC20Upgradeable public rewardToken;
+    bool pauses;
+    uint256 public rewardRate;
+    uint256 public unbondingPeriod;
+    uint256 public rewardDelay;
 
-    struct StakeInfo
-    {
+    struct Stake {
+        address owner;
+        uint256 tokenId;
         uint256 startBlock;
-        uint256 tokenID;
-        bool unstaking;
-        uint256 unstakeStartBlock;
+        uint256 endBlock;
     }
-    mapping(address => StakeInfo[])public stakes;
-    mapping(address=>uint256) public override rewards;
 
+    mapping(address => Stake[]) public stakes;
+    mapping(address => uint256) public lastClaimedBlock;
+
+    event Staked(address indexed user, uint256 tokenId, uint256 startBlock);
+    event Unstaked(address indexed user, uint256 tokenId, uint256 endBlock);
+    event RewardsClaimed(address indexed user, uint256 amount);
 
     function initialize(
-        address _rewardToken,
         address _nft,
+        address _rewardToken,
         uint256 _rewardRate,
-        uint256 _unbondingPeriod
-    )public initializer{
-        _Ownable_init();
-        _UUPSUpgradable_init();
-        rewardToken=_rewardToken;
-        rewardRate=_rewardRate;
-        nft=IERC721(_nft);
-        unbondingPeriod=_unbondingPeriod;
-        paused=false;
+        uint256 _unbondingPeriod,
+        uint256 _rewardDelay
+    ) public initializer {
+        __Ownable_init(msg.sender);
+        __Pausable_init();
+        __UUPSUpgradeable_init();
+        nft = ERC721Upgradeable(_nft);
+        rewardToken = ERC20Upgradeable(_rewardToken);
+        rewardRate = _rewardRate;
+        unbondingPeriod = _unbondingPeriod;
+        rewardDelay = _rewardDelay;
     }
 
-    function setRewardRate(uint256 _rewardRate) external override onlyOwner{
-        rewardrate =_rewardRate
+    function pause()external  onlyOwner{
+        pauses =true;
     }
-
-    function pause()external override onlyOwner{
-        paused =true;
-    }
-    function unpause() external override OnlyOwner{
-        paused =false;
-    }
-
-    modifier when_unPaused(){
-        require(!paused,"Staking is paused");
-        _;
+    function unpause() external  onlyOwner{
+        pauses =false;
     }
 
 
-    function stake(uint256 tokenID)external override when_unPaused{
-        nft.transferFrom(msg.sender,address(this),tokenID);
-        stakes[msg.sender].push(StakeInfo(block.number,tokenID,false,0));
+    function stake(uint256 tokenId) external whenNotPaused {
+        nft.transferFrom(msg.sender, address(this), tokenId);
+        stakes[msg.sender].push(Stake(msg.sender, tokenId, block.number, 0));
+        emit Staked(msg.sender, tokenId, block.number);
     }
-    function unstake(uint256 _tokenID)external override when_unPaused{
-        for(uint256 i=0; i<stakes[msg.sender].length; i++){
-            if( stakes[msg.sender][i].tokenID==_tokenID && !stakes[msg.sender][i].unstaking){
-                stakes[msg.sender][i].unstaking=true;
-                stakes[msg.sender][i].unstakeStartBlock=block.number;
-                uint256 stakingDuration =block.number -stakes[msg.sender][i].startBlock;
-                rewards[msg.sender]+=stakingduration*rewardRate;
-                break;
+
+    function unstake(uint256 tokenId) external whenNotPaused {
+        Stake[] storage userStakes = stakes[msg.sender];
+        for (uint256 i = 0; i < userStakes.length; i++) {
+            if (userStakes[i].tokenId == tokenId && userStakes[i].endBlock == 0) {
+                userStakes[i].endBlock = block.number + unbondingPeriod;
+                emit Unstaked(msg.sender, tokenId, userStakes[i].endBlock);
+                return;
             }
         }
+        revert("Token not found or already unstaked");
     }
 
-    function withdraw(uint256 _tokenID)external when_unPaused{
-        for(uint256 i=0; i<stakes[msg.sender].length; i++){
-            if( stakes[msg.sender][i].tokenID==_tokenID && !stakes[msg.sender][i].unstaking){
-                require(block.number >=stakes[msg.sender][i].unstakeStartBlock+unbondingPeriod,"Unbonding period is not over yet. Please Try again later.");
-                nft.transferFrom(address(this),msg.sender,_tokenID);
-                stakes[msg.sender][i]=stakes[msg.sender][stakes[msg.sender].length-1];
-                stakes[msg.sender].pop();
-                break;
+    function withdraw(uint256 tokenId) external {
+        Stake[] storage userStakes = stakes[msg.sender];
+        for (uint256 i = 0; i < userStakes.length; i++) {
+            if (userStakes[i].tokenId == tokenId && userStakes[i].endBlock > 0 && block.number >= userStakes[i].endBlock) {
+                nft.transferFrom(address(this), msg.sender, tokenId);
+                userStakes[i] = userStakes[userStakes.length - 1];
+                userStakes.pop();
+                return;
             }
         }
+        revert("Token not found or unbonding period not ended");
     }
 
-    function claimRewards()external override when_unPaused{
-        uint256 reward=calculaterewards(msg.sender);
-        rewards[msg.sender]=0;
-        rewardToken.transfer(msg.sender,reward);
+    function claimRewards() external {
+        uint256 rewards = calculateRewards(msg.sender);
+        require(rewardToken.transfer(msg.sender, rewards), "Reward transfer failed");
+        lastClaimedBlock[msg.sender] = block.number;
+        emit RewardsClaimed(msg.sender, rewards);
     }
-    function calculateRewards(address staker)publicview override returns(uint256){
-        uint256 totalreward=rewards[staker];
-        for(uint256 i=0;i<stakes[staker];i++){
-            StakeInfo storage stake=stakes[stakerr][i];
-            f(!stake.unstaking){
-                uint256 stakingDuration=block.number-stake.stake.startBlock;
-                totalReward+=stakingduration*rewardRate;
+
+    function calculateRewards(address user) public view returns (uint256) {
+        Stake[] storage userStakes = stakes[user];
+        uint256 totalRewards = 0;
+        uint256 lastClaimed = lastClaimedBlock[user];
+        for (uint256 i = 0; i < userStakes.length; i++) {
+            uint256 endBlock = userStakes[i].endBlock == 0 ? block.number : userStakes[i].endBlock;
+            if (lastClaimed < endBlock) {
+                totalRewards += (endBlock - lastClaimed) * rewardRate;
             }
         }
-        return totalReward;
+        return totalRewards;
     }
-    function stakes(address staker) external view override returns (StakeInfo[] memory) {
-        return stakes[staker];
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    function setRewardRate(uint256 newRewardRate) external onlyOwner {
+        rewardRate = newRewardRate;
+    }
+
+    function setUnbondingPeriod(uint256 newUnbondingPeriod) external onlyOwner {
+        unbondingPeriod = newUnbondingPeriod;
+    }
+
+    function setRewardDelay(uint256 newRewardDelay) external onlyOwner {
+        rewardDelay = newRewardDelay;
+    }
+
+    function pauseStaking() external onlyOwner {
+        _pause();
+    }
+
+    function unpauseStaking() external onlyOwner {
+        _unpause();
     }
 }

@@ -1,5 +1,5 @@
 //SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.24;
 
 //ERC20 interface as outlined by OpenZepellin
 interface IERC20 {
