@@ -8,7 +8,7 @@ async function main() {
     const rewardToken = await RewardToken.deploy("Reward Token", "RTK", 18);
     await rewardToken.deployed();
 
-    const NFT = await ethers.getContractFactory("ERC721Mock");
+    const NFT = await ethers.getContractFactory("MockERC721");
     const nft = await NFT.deploy("NFT", "NFT");
     await nft.deployed();
 

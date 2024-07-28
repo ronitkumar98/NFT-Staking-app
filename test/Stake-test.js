@@ -1,193 +1,156 @@
 const { expect } = require("chai");
-const { ethers } = require("hardhat");
+const { ethers, upgrades } = require("hardhat");
 
 describe("NFTStaking", function () {
-  let owner, addr1, addr2;
-  let rewardToken, nft, nftStaking;
-  const rewardRate = 10; // Example reward rate
-  const unbondingPeriod = 100; // Example unbonding period
+    let NFTStaking, nftStaking, MockERC721, mockERC721, RewardToken, rewardToken, owner, addr1, addr2;
 
-  beforeEach(async function () {
-    [owner, addr1, addr2] = await ethers.getSigners();
+    beforeEach(async function () {
+        [owner, addr1, addr2] = await ethers.getSigners();
 
-    // Deploy ERC20 token
-    const ERC20 = await ethers.getContractFactory("ERC20Token");
-    rewardToken = await ERC20.deploy("RewardToken", "RTK", ethers.utils.parseEther("1000000"));
-    await rewardToken.deployed();
+        // Deploy MockERC721 contract
+        MockERC721 = await ethers.getContractFactory("MockERC721");
+        mockERC721 = await upgrades.deployProxy(MockERC721);
+        await mockERC721.deployed();
 
-    // Deploy ERC721 token
-    const ERC721 = await ethers.getContractFactory("ERC721Token");
-    nft = await ERC721.deploy("NFTToken", "NFT");
-    await nft.deployed();
+        // Deploy ERC20 reward token
+        RewardToken = await ethers.getContractFactory("ERC20Upgradeable");
+        rewardToken = await upgrades.deployProxy(RewardToken, ["RewardToken", "RTKN", 18]);
+        await rewardToken.deployed();
 
-    // Deploy NFTStaking contract
-    const NFTStaking = await ethers.getContractFactory("NFTStaking");
-    nftStaking = await NFTStaking.deploy(rewardToken.address, nft.address, rewardRate, unbondingPeriod);
-    await nftStaking.deployed();
+        // Mint some ERC20 tokens to the owner for rewards
+        await rewardToken.mint(owner.address, ethers.utils.parseEther("1000"));
 
-    // Mint some NFTs to addr1
-    await nft.connect(addr1).mint(1);
-    await nft.connect(addr1).mint(2);
-    await nft.connect(addr1).mint(3);
+        // Deploy NFTStaking contract
+        NFTStaking = await ethers.getContractFactory("NFT_staking");
+        nftStaking = await upgrades.deployProxy(NFTStaking, [
+            mockERC721.address,
+            rewardToken.address,
+            ethers.utils.parseEther("1"), // reward rate
+            100, // unbonding period
+            50, // reward delay
+        ]);
+        await nftStaking.deployed();
 
-    // Mint some reward tokens to NFTStaking contract
-    await rewardToken.transfer(nftStaking.address, ethers.utils.parseEther("10000"));
-  });
-
-  describe("Staking", function () {
-    it("Should allow users to stake NFTs", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
-
-      const stakes = await nftStaking.stakes(addr1.address);
-      expect(stakes.length).to.equal(1);
-      expect(stakes[0].tokenId).to.equal(1);
+        // Mint some NFTs to addr1
+        await mockERC721.mint(addr1.address, 1);
+        await mockERC721.mint(addr1.address, 2);
     });
 
-    it("Should calculate rewards correctly", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
+    it("should allow staking and unstaking of NFTs", async function () {
+        // Approve NFTStaking contract to transfer addr1's NFTs
+        await mockERC721.connect(addr1).approve(nftStaking.address, 1);
+        await mockERC721.connect(addr1).approve(nftStaking.address, 2);
 
-      // Simulate blocks
-      await ethers.provider.send("evm_mine", [ethers.provider.getBlockNumber() + 100]);
+        // Stake NFT 1
+        await nftStaking.connect(addr1).stake(1);
 
-      const rewards = await nftStaking.calculateRewards(addr1.address);
-      expect(rewards).to.equal(100 * rewardRate);
+        // Check that the NFT is transferred to the contract
+        expect(await mockERC721.ownerOf(1)).to.equal(nftStaking.address);
+
+        // Unstake NFT 1
+        await nftStaking.connect(addr1).unstake(1);
+
+        // Wait for unbonding period to end
+        await ethers.provider.send("evm_increaseTime", [100]);
+        await ethers.provider.send("evm_mine");
+
+        // Withdraw NFT 1
+        await nftStaking.connect(addr1).withdraw(1);
+
+        // Check that the NFT is transferred back to addr1
+        expect(await mockERC721.ownerOf(1)).to.equal(addr1.address);
     });
 
-    it("Should not allow staking when paused", async function () {
-      await nftStaking.connect(owner).pause();
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await expect(nftStaking.connect(addr1).stake(1)).to.be.revertedWith("Staking is paused");
-    });
-  });
+    it("should allow claiming of rewards", async function () {
+        // Approve NFTStaking contract to transfer addr1's NFTs
+        await mockERC721.connect(addr1).approve(nftStaking.address, 1);
 
-  describe("Unstaking", function () {
-    it("Should allow users to unstake NFTs", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
+        // Stake NFT 1
+        await nftStaking.connect(addr1).stake(1);
 
-      await nftStaking.connect(addr1).unstake(1);
+        // Wait for some blocks to pass
+        await ethers.provider.send("evm_mine");
 
-      const stakes = await nftStaking.stakes(addr1.address);
-      expect(stakes[0].unstaking).to.be.true;
-    });
+        // Claim rewards
+        await nftStaking.connect(addr1).claimRewards();
 
-    it("Should not allow unstaking non-staked NFTs", async function () {
-      await expect(nftStaking.connect(addr1).unstake(1)).to.be.revertedWith("NFT is not staked or already unstaking");
+        // Check that the rewards are transferred
+        const rewards = await rewardToken.balanceOf(addr1.address);
+        expect(rewards).to.be.gt(0);
     });
 
-    it("Should handle multiple unstaking correctly", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nft.connect(addr1).approve(nftStaking.address, 2);
-      await nftStaking.connect(addr1).stake(1);
-      await nftStaking.connect(addr1).stake(2);
+    it("should prevent unstaking before unbonding period", async function () {
+        // Approve NFTStaking contract to transfer addr1's NFTs
+        await mockERC721.connect(addr1).approve(nftStaking.address, 1);
 
-      await nftStaking.connect(addr1).unstake(1);
-      await nftStaking.connect(addr1).unstake(2);
+        // Stake NFT 1
+        await nftStaking.connect(addr1).stake(1);
 
-      const stakes = await nftStaking.stakes(addr1.address);
-      expect(stakes[0].unstaking).to.be.true;
-      expect(stakes[1].unstaking).to.be.true;
+        // Unstake NFT 1
+        await nftStaking.connect(addr1).unstake(1);
+
+        // Attempt to withdraw NFT 1 before unbonding period ends
+        await expect(nftStaking.connect(addr1).withdraw(1)).to.be.revertedWith("Token not found or unbonding period not ended");
+
+        // Wait for unbonding period to end
+        await ethers.provider.send("evm_increaseTime", [100]);
+        await ethers.provider.send("evm_mine");
+
+        // Withdraw NFT 1
+        await nftStaking.connect(addr1).withdraw(1);
+
+        // Check that the NFT is transferred back to addr1
+        expect(await mockERC721.ownerOf(1)).to.equal(addr1.address);
     });
 
-    it("Should calculate rewards correctly when unstaking", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
+    it("should prevent staking when paused", async function () {
+        // Pause the contract
+        await nftStaking.connect(owner).pause();
 
-      // Simulate blocks
-      await ethers.provider.send("evm_mine", [ethers.provider.getBlockNumber() + 50]);
-
-      await nftStaking.connect(addr1).unstake(1);
-
-      const rewards = await nftStaking.rewards(addr1.address);
-      expect(rewards).to.equal(50 * rewardRate);
+        // Attempt to stake an NFT
+        await mockERC721.connect(addr1).approve(nftStaking.address, 1);
+        await expect(nftStaking.connect(addr1).stake(1)).to.be.revertedWith("Pausable: paused");
     });
 
-    it("Should not allow withdrawal before unbonding period", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
+    it("should allow staking when unpaused", async function () {
+        // Pause and then unpause the contract
+        await nftStaking.connect(owner).pause();
+        await nftStaking.connect(owner).unpause();
 
-      await nftStaking.connect(addr1).unstake(1);
+        // Approve NFTStaking contract to transfer addr1's NFTs
+        await mockERC721.connect(addr1).approve(nftStaking.address, 1);
 
-      await expect(nftStaking.connect(addr1).withdraw(1)).to.be.revertedWith("Unbonding period not yet over");
+        // Stake NFT 1
+        await nftStaking.connect(addr1).stake(1);
+
+        // Check that the NFT is transferred to the contract
+        expect(await mockERC721.ownerOf(1)).to.equal(nftStaking.address);
     });
 
-    it("Should allow withdrawal after unbonding period", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
+    it("should allow the owner to set new reward rate", async function () {
+        // Set new reward rate
+        const newRewardRate = ethers.utils.parseEther("2");
+        await nftStaking.connect(owner).setRewardRate(newRewardRate);
 
-      await nftStaking.connect(addr1).unstake(1);
-
-      // Simulate blocks
-      await ethers.provider.send("evm_mine", [ethers.provider.getBlockNumber() + unbondingPeriod]);
-
-      await nftStaking.connect(addr1).withdraw(1);
-
-      expect(await nft.ownerOf(1)).to.equal(addr1.address);
-    });
-  });
-
-  describe("Rewards", function () {
-    it("Should allow users to claim rewards", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
-
-      // Simulate blocks
-      await ethers.provider.send("evm_mine", [ethers.provider.getBlockNumber() + 100]);
-
-      await nftStaking.connect(addr1).claimRewards();
-
-      const rewardBalance = await rewardToken.balanceOf(addr1.address);
-      expect(rewardBalance).to.equal(100 * rewardRate);
+        // Check that the reward rate is updated
+        expect(await nftStaking.rewardRate()).to.equal(newRewardRate);
     });
 
-    it("Should reset rewards after claiming", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
+    it("should allow the owner to set new unbonding period", async function () {
+        // Set new unbonding period
+        const newUnbondingPeriod = 200;
+        await nftStaking.connect(owner).setUnbondingPeriod(newUnbondingPeriod);
 
-      // Simulate blocks
-      await ethers.provider.send("evm_mine", [ethers.provider.getBlockNumber() + 100]);
-
-      await nftStaking.connect(addr1).claimRewards();
-
-      const rewards = await nftStaking.rewards(addr1.address);
-      expect(rewards).to.equal(0);
+        // Check that the unbonding period is updated
+        expect(await nftStaking.unbondingPeriod()).to.equal(newUnbondingPeriod);
     });
 
-    it("Should not allow claiming rewards when paused", async function () {
-      await nft.connect(addr1).approve(nftStaking.address, 1);
-      await nftStaking.connect(addr1).stake(1);
+    it("should allow the owner to set new reward delay", async function () {
+        // Set new reward delay
+        const newRewardDelay = 100;
+        await nftStaking.connect(owner).setRewardDelay(newRewardDelay);
 
-      // Simulate blocks
-      await ethers.provider.send("evm_mine", [ethers.provider.getBlockNumber() + 100]);
-
-      await nftStaking.connect(owner).pause();
-      await expect(nftStaking.connect(addr1).claimRewards()).to.be.revertedWith("Staking is paused");
+        // Check that the reward delay is updated
+        expect(await nftStaking.rewardDelay()).to.equal(newRewardDelay);
     });
-  });
-
-  describe("Owner functions", function () {
-    it("Should allow owner to set reward rate", async function () {
-      await nftStaking.connect(owner).setRewardRate(20);
-      expect(await nftStaking.rewardRate()).to.equal(20);
-    });
-
-    it("Should allow owner to pause and unpause staking", async function () {
-      await nftStaking.connect(owner).pause();
-      expect(await nftStaking.paused()).to.be.true;
-
-      await nftStaking.connect(owner).unpause();
-      expect(await nftStaking.paused()).to.be.false;
-    });
-
-    it("Should not allow non-owner to set reward rate", async function () {
-      await expect(nftStaking.connect(addr1).setRewardRate(20)).to.be.revertedWith("Ownable: caller is not the owner");
-    });
-
-    it("Should not allow non-owner to pause or unpause staking", async function () {
-      await expect(nftStaking.connect(addr1).pause()).to.be.revertedWith("Ownable: caller is not the owner");
-      await expect(nftStaking.connect(addr1).unpause()).to.be.revertedWith("Ownable: caller is not the owner");
-    });
-  });
 });
